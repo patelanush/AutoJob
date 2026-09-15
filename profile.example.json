@@ -1,0 +1,22 @@
+{
+  "personal": {
+    "firstName": "Example",
+    "lastName": "Applicant",
+    "email": "applicant@example.com",
+    "phone": "5550100000",
+    "address": "123 Example Street",
+    "city": "Example City",
+    "state": "AZ",
+    "zip": "00000",
+    "country": "United States"
+  },
+  "links": {},
+  "education": [],
+  "employment": [],
+  "authorization": {},
+  "demographics": {},
+  "preferences": {},
+  "approvedFacts": {},
+  "resume": { "path": "private/resume.pdf" },
+  "browser": { "reviewTabLimit": 10 }
+}
