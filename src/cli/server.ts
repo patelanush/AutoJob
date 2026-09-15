@@ -10,6 +10,7 @@ import { runs, facts, factHistory } from "../db/schema.js";
 import { root } from "../config/profile.js";
 import { artifactPath } from "../security/privacy.js";
 import { identify } from "../feed/identity.js";
+import { ATS_TYPES } from "../feed/selection.js";
 const idParams = z.object({ id: z.string().uuid() });
 export async function createAPI(runtime: Runtime, port = 4317) {
   const app = Fastify({ logger: false, bodyLimit: 100000 }),
@@ -43,6 +44,7 @@ export async function createAPI(runtime: Runtime, port = 4317) {
     feedExceptions: runtime.feedExceptions,
     retained: runtime.sessions.retained(),
     limit: 10,
+    capabilities: { runLimit: true, atsFilter: true },
     lastRun: runtime.store.db
       .select()
       .from(runs)
@@ -75,9 +77,16 @@ export async function createAPI(runtime: Runtime, port = 4317) {
   });
   app.post("/api/applications/:id/resume", async (req) => {
     const body = z
-      .object({ humanResolved: z.boolean().default(false) })
+      .object({
+        humanResolved: z.boolean().default(false),
+        only: z.boolean().default(false),
+      })
       .parse(req.body);
-    await runtime.retry(idParams.parse(req.params).id, body.humanResolved);
+    await runtime.retry(
+      idParams.parse(req.params).id,
+      body.humanResolved,
+      body.only,
+    );
     return { ok: true };
   });
   app.post("/api/applications/:id/close", async (req) => {
@@ -86,13 +95,16 @@ export async function createAPI(runtime: Runtime, port = 4317) {
     await runtime.sessions.close(idParams.parse(req.params).id);
     return { ok: true };
   });
-  app.post("/api/run", async (req) =>
-    runtime.ingest(
-      z
-        .object({ lookback: z.number().int().min(0).max(30).default(7) })
-        .parse(req.body).lookback,
-    ),
-  );
+  app.post("/api/run", async (req) => {
+    const input = z
+      .object({
+        lookback: z.number().int().min(0).max(30).default(7),
+        limit: z.number().int().positive().optional(),
+        ats: z.enum(ATS_TYPES).optional(),
+      })
+      .parse(req.body);
+    return runtime.ingest(input.lookback, input.limit, input.ats);
+  });
   app.post("/api/continue", () => {
     runtime.continue();
     return { ok: true };

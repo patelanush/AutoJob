@@ -10,6 +10,11 @@ import {
 } from "../config/profile.js";
 import { Store } from "../db/store.js";
 import { fetchFeed, parseFeed, eligible } from "../feed/parser.js";
+import {
+  parseAtsType,
+  parseLimit,
+  planFeedSelection,
+} from "../feed/selection.js";
 import { checkGitSafety } from "../security/privacy.js";
 import { Keychain, promptSecret } from "../security/keychain.js";
 import { GmailVerification } from "../verification/gmail.js";
@@ -162,15 +167,35 @@ program.command("extract-resume").action(async () => {
 program
   .command("dry-run")
   .option("--lookback <days>", "Inclusive age window", "7")
+  .option("--ats <type>", "Only select new jobs for this ATS")
+  .option("--limit <number>", "Cap new jobs that would be processed")
   .action(async (opts) => {
     const lookback = Number(opts.lookback);
+    const limit = parseLimit(opts.limit);
+    const ats = parseAtsType(opts.ats);
     if (!Number.isInteger(lookback) || lookback < 0 || lookback > 30)
       throw new Error("Lookback must be 0–30");
     const { jobs, warnings } = parseFeed(await fetchFeed());
     const store = existsSync(paths.db) ? new Store(paths.db, false) : undefined;
     try {
+      const plan = planFeedSelection(
+        jobs,
+        lookback,
+        (fingerprint) => {
+          const job = store?.findIdentity(fingerprint);
+          return !!job && !!store?.hasApplication(job.id);
+        },
+        limit,
+        ats,
+      );
+      const selected = new Set(
+          plan.selected.map((job) => job.identity!.fingerprint),
+        ),
+        newJobs = new Set(plan.newJobs.map((job) => job.identity!.fingerprint)),
+        matchingAts = new Set(
+          plan.matchingAts.map((job) => job.identity!.fingerprint),
+        );
       const seen = new Set<string>();
-      let known = 0;
       const report = jobs
         .filter((j) => eligible(j, lookback))
         .map((j) => {
@@ -181,23 +206,27 @@ program
               age: j.ageDays,
               action: "UNRESOLVED DIRECT LINK",
             };
-          const job = store?.findIdentity(j.identity.fingerprint);
-          const app = job
-            ? store?.list().find((a) => a.job.id === job.id)
-            : undefined;
           const duplicate = seen.has(j.identity.fingerprint);
           seen.add(j.identity.fingerprint);
-          if (app || duplicate) known++;
+          const job = store?.findIdentity(j.identity.fingerprint);
+          const known = !!job && !!store?.hasApplication(job.id);
           return {
+            id: job?.id ?? j.identity.fingerprint,
             company: j.company,
             role: j.role,
             age: j.ageDays,
             ats: j.identity.atsType,
-            action: app
-              ? `KNOWN: ${app.application.status}`
+            action: known
+              ? "ALREADY KNOWN"
               : duplicate
                 ? "DUPLICATE FEED ROW"
-                : "WOULD QUEUE",
+                : selected.has(j.identity.fingerprint)
+                  ? "WOULD PROCESS"
+                  : newJobs.has(j.identity.fingerprint)
+                    ? matchingAts.has(j.identity.fingerprint)
+                      ? "DEFERRED BY LIMIT"
+                      : "EXCLUDED BY ATS FILTER"
+                    : "NOT SELECTED",
             url: j.originalApplyUrl,
           };
         });
@@ -205,9 +234,17 @@ program
       console.log(
         JSON.stringify(
           {
-            eligibleRows: report.length,
-            wouldQueue: report.filter((r) => r.action === "WOULD QUEUE").length,
-            alreadyKnown: known,
+            eligibleRows: plan.eligibleRows,
+            totalNewJobs: plan.newJobs.length,
+            matchingAts: plan.matchingAts.length,
+            excludedByAts: plan.excludedByAts,
+            wouldProcess: plan.selected.length,
+            deferredByLimit: plan.deferred,
+            alreadyKnown: plan.alreadyKnown,
+            unresolvedDirectLinks: plan.unresolvedRows,
+            duplicateFeedRows: plan.duplicateRows,
+            limit: limit ?? null,
+            ats: ats ?? null,
             warnings,
           },
           null,
@@ -221,13 +258,29 @@ program
 program
   .command("apply")
   .option("--lookback <days>", "Inclusive window", "7")
+  .option("--ats <type>", "Only process new jobs for this ATS")
+  .option("--limit <number>", "Process at most this many new applications")
   .action(async (opts) => {
-    loadProfile(true);
     const lookback = Number(opts.lookback);
+    const limit = parseLimit(opts.limit);
+    const ats = parseAtsType(opts.ats);
     if (!Number.isInteger(lookback) || lookback < 0 || lookback > 30)
       throw new Error("Invalid lookback");
+    loadProfile(true);
     await ensureRuntime();
-    console.log(await api("/api/run", { lookback }));
+    if (limit !== undefined || ats !== undefined) {
+      const status = (await api("/api/status")) as {
+        capabilities?: { runLimit?: boolean; atsFilter?: boolean };
+      };
+      if (
+        (limit !== undefined && !status.capabilities?.runLimit) ||
+        (ats !== undefined && !status.capabilities?.atsFilter)
+      )
+        throw new Error(
+          "The running dashboard predates the requested queue filters. Restart it before this run.",
+        );
+    }
+    console.log(await api("/api/run", { lookback, limit, ats }));
     console.log(
       `Worker is sequential; review at ${base}. Final Submit is yours.`,
     );
@@ -252,6 +305,7 @@ program.command("status").action(async () => {
   const store = new Store(paths.db, false);
   console.table(
     store.list().map(({ job, application }) => ({
+      applicationId: application.id,
       company: job.company,
       role: job.role,
       status: application.status,
@@ -265,7 +319,9 @@ program
   .requiredOption("--application <id>")
   .action(async (opts) => {
     await ensureRuntime();
-    console.log(await api(`/api/applications/${opts.application}/resume`, {}));
+    console.log(
+      await api(`/api/applications/${opts.application}/resume`, { only: true }),
+    );
   });
 program
   .command("history")

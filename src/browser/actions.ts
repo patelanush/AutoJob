@@ -1,5 +1,6 @@
 import type { Page, Locator, Frame } from "playwright";
 import { safeUrl } from "../security/privacy.js";
+import { locationCandidates, locationOptionScore } from "../utils/location.js";
 export type Stage =
   | "LANDING"
   | "AUTH"
@@ -104,6 +105,31 @@ interface BoundField {
   field: Field;
   locator: Locator;
   frame: Frame;
+}
+const comparable = (value: string) =>
+  value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+export function fieldValueMatches(field: Field, expected: string) {
+  if (!field.value) return false;
+  if (
+    /phone|mobile|cell|telephone/i.test(field.label) ||
+    field.type === "tel"
+  ) {
+    const actualDigits = field.value.replace(/\D/g, ""),
+      expectedDigits = expected.replace(/\D/g, "");
+    return actualDigits.length >= 7 && actualDigits === expectedDigits;
+  }
+  if (field.type === "checkbox" || field.type === "radio")
+    return (
+      field.value === "checked" &&
+      (expected === "checked" ||
+        comparable(field.optionLabel ?? "") === comparable(expected))
+    );
+  if (/location/i.test(field.label) && field.type === "combobox")
+    return locationOptionScore(expected, field.value) > 0;
+  return comparable(field.value) === comparable(expected);
 }
 export class BrowserActions {
   stage: Stage = "LANDING";
@@ -215,6 +241,18 @@ export class BrowserActions {
     }
     return false;
   }
+  async waitForApplicationForm(name: RegExp, timeout = 20000) {
+    this.own();
+    try {
+      await this.page
+        .getByLabel(name)
+        .first()
+        .waitFor({ state: "attached", timeout });
+      return true;
+    } catch {
+      return false;
+    }
+  }
   async advance(purpose: Purpose, name: RegExp) {
     await this.checkpoint();
     const visible: Locator[] = [];
@@ -255,7 +293,7 @@ export class BrowserActions {
     for (const frame of this.page.frames()) {
       const locators = await frame
         .locator(
-          "input:not([type=hidden]):not([type=submit]):not([type=button]),textarea,select,[role=combobox]:not(input):not(select),[role=checkbox]:not(input),[role=radio]:not(input)",
+          "input:not([type=hidden]):not([type=submit]):not([type=button]),textarea,select,[role=combobox]:not(input):not(select),[role=checkbox]:not(input),[role=radio]:not(input),button[aria-pressed][data-option]",
         )
         .all();
       for (const locator of locators) {
@@ -278,6 +316,10 @@ export class BrowserActions {
         const f = await locator.evaluate((el) => {
           const input = el as HTMLInputElement;
           const formEl = el as HTMLSelectElement;
+          const customOption =
+            el.tagName === "BUTTON" &&
+            el.hasAttribute("aria-pressed") &&
+            el.hasAttribute("data-option");
           const labels =
             "labels" in el
               ? Array.from((el as HTMLInputElement).labels ?? [])
@@ -289,13 +331,20 @@ export class BrowserActions {
             ?.split(" ")
             .map((id) => document.getElementById(id)?.textContent ?? "")
             .join(" ");
-          const fieldset = el.closest("fieldset,[role=radiogroup]"),
+          const fieldset = el.closest(
+              "fieldset,[role=radiogroup],[data-field-path],[data-field-entry-id]",
+            ),
+            heading = fieldset?.querySelector(
+              ":scope > legend,:scope > label,[data-question-title]",
+            ),
             legend =
               fieldset?.querySelector("legend")?.textContent ??
               fieldset?.getAttribute("aria-label") ??
+              heading?.textContent ??
               "";
-          const type =
-            el.tagName === "SELECT"
+          const type = customOption
+            ? "radio"
+            : el.tagName === "SELECT"
               ? "select"
               : el.tagName === "TEXTAREA"
                 ? "textarea"
@@ -304,14 +353,19 @@ export class BrowserActions {
                     )
                   ? el.getAttribute("role")!
                   : (el.getAttribute("type") ?? "text");
+          const optionLabel =
+            labels ||
+            by ||
+            el.getAttribute("aria-label") ||
+            (customOption ? el.textContent : "") ||
+            "";
           const label = (
-            type === "radio"
-              ? legend +
-                " " +
-                (labels || by || el.getAttribute("aria-label") || "")
+            type === "radio" || (type === "checkbox" && legend)
+              ? legend + " " + optionLabel
               : labels ||
                 by ||
                 el.getAttribute("aria-label") ||
+                legend ||
                 el.getAttribute("placeholder") ||
                 (type === "file"
                   ? el
@@ -342,6 +396,15 @@ export class BrowserActions {
                 ),
               )
             : [];
+          let visualRequired = false;
+          if (heading) {
+            const marker = `${getComputedStyle(heading, "::before").content} ${getComputedStyle(heading, "::after").content}`;
+            visualRequired =
+              /\*/.test(marker.replace(/["']/g, "")) ||
+              /required/i.test(heading.className) ||
+              heading.getAttribute("aria-required") === "true" ||
+              heading.getAttribute("data-required") === "true";
+          }
           return {
             label,
             type,
@@ -349,21 +412,31 @@ export class BrowserActions {
             required:
               input.required ||
               el.getAttribute("aria-required") === "true" ||
-              /\*/.test(label),
+              /\*/.test(label) ||
+              visualRequired,
             value:
               type === "checkbox" || type === "radio"
-                ? input.checked || el.getAttribute("aria-checked") === "true"
+                ? input.checked ||
+                  el.getAttribute("aria-checked") === "true" ||
+                  el.getAttribute("aria-pressed") === "true"
                   ? "checked"
                   : ""
-                : (input.value ?? ""),
+                : type === "select"
+                  ? (formEl.selectedOptions[0]?.textContent ?? "")
+                  : (input.value ?? el.textContent ?? ""),
             error:
               el.getAttribute("aria-invalid") === "true" ? "Invalid field" : "",
             section,
             maxLength: input.maxLength > 0 ? input.maxLength : undefined,
             groupIndex: group ? Math.max(0, peers.indexOf(group)) : 0,
-            groupLabel: legend,
-            optionLabel: labels || by || el.getAttribute("aria-label") || "",
-            groupName: input.name,
+            groupLabel: legend.trim(),
+            optionLabel: optionLabel.trim(),
+            groupName:
+              input.name ||
+              fieldset?.querySelector<HTMLInputElement>(
+                "input[type=checkbox],input[type=radio]",
+              )?.name ||
+              "",
             id: el.id,
           };
         });
@@ -394,10 +467,18 @@ export class BrowserActions {
     if (!b) throw new SafetyStop("Stale field reference");
     if (/password|file/.test(b.field.type))
       throw new SafetyStop("Use authorized credential/file interface");
+    if (fieldValueMatches(b.field, value)) return false;
     if (b.field.type === "select")
       await b.locator.selectOption({ label: value });
     else if (b.field.type === "checkbox" || b.field.type === "radio") {
-      if (value === "Yes" || value === "checked") await b.locator.check();
+      if ((await b.locator.getAttribute("aria-pressed")) !== null) {
+        if (!/^(?:yes|no)$/i.test(b.field.optionLabel ?? ""))
+          throw new SafetyStop("Unsupported custom option control");
+        await b.locator.click();
+        if ((await b.locator.getAttribute("aria-pressed")) !== "true")
+          throw new SafetyStop("Custom option did not retain selection");
+      } else if (value === "Yes" || value === "checked")
+        await b.locator.check();
       else if (b.field.type === "checkbox") await b.locator.uncheck();
     } else if (b.field.type === "combobox") {
       const button = await b.locator.evaluate((el) => el.tagName !== "INPUT");
@@ -411,14 +492,53 @@ export class BrowserActions {
         )
           throw new SafetyStop("Combobox could submit form");
         await b.locator.click();
-      } else await b.locator.fill(value);
-      const option = b.frame.getByRole("option", { name: value, exact: true });
-      if ((await option.count()) !== 1)
-        throw new SafetyStop("Autocomplete option is ambiguous");
+      }
+      let selected: { locator: Locator; label: string } | undefined;
+      for (const candidate of locationCandidates(value)) {
+        if (!button) {
+          await b.locator.fill(candidate);
+          await b.locator.press("ArrowDown").catch(() => undefined);
+        }
+        await b.frame
+          .getByRole("option")
+          .first()
+          .waitFor({ state: "visible", timeout: 5000 })
+          .catch(() => undefined);
+        const scored: { locator: Locator; label: string; score: number }[] = [];
+        for (const option of await b.frame.getByRole("option").all()) {
+          if (!(await option.isVisible())) continue;
+          const label = (await option.innerText()).replace(/\s+/g, " ").trim(),
+            score = locationOptionScore(value, label);
+          if (score) scored.push({ locator: option, label, score });
+        }
+        scored.sort((a, z) => z.score - a.score);
+        if (
+          scored.length &&
+          (scored.length === 1 || scored[0].score > scored[1].score)
+        ) {
+          selected = scored[0];
+          break;
+        }
+      }
+      if (!selected)
+        throw new SafetyStop("Autocomplete location option is ambiguous");
       this.own();
-      await option.click();
+      await selected.locator.click();
+      const accepted = await b.locator
+        .evaluate((el) =>
+          el instanceof HTMLInputElement ? el.value : (el.textContent ?? ""),
+        )
+        .catch(() => "");
+      const collapsed =
+        (await b.locator.getAttribute("aria-expanded")) === "false";
+      if (
+        locationOptionScore(value, accepted) === 0 ||
+        (!collapsed && comparable(accepted) !== comparable(selected.label))
+      )
+        throw new SafetyStop("Autocomplete location did not retain selection");
     } else await b.locator.fill(value);
     this.own();
+    return true;
   }
   async upload(token: number, path: string) {
     await this.checkpoint();
@@ -609,5 +729,93 @@ export class BrowserActions {
         if (await c.isVisible()) finalVisible = true;
     }
     return { missing, errors: await errors.allTextContents(), finalVisible };
+  }
+  async formDiagnostics() {
+    const totals = {
+      inputs: 0,
+      textareas: 0,
+      buttons: 0,
+      selects: 0,
+      comboboxes: 0,
+      radios: 0,
+      fileInputs: 0,
+    };
+    const accessibleNames: string[] = [],
+      sanitizedForms: string[] = [];
+    for (const frame of this.page.frames()) {
+      const counts = await frame
+        .locator("body")
+        .evaluate((body) => ({
+          inputs: body.querySelectorAll("input").length,
+          textareas: body.querySelectorAll("textarea").length,
+          buttons: body.querySelectorAll("button").length,
+          selects: body.querySelectorAll("select").length,
+          comboboxes: body.querySelectorAll("[role=combobox]").length,
+          radios: body.querySelectorAll("input[type=radio],[role=radio]")
+            .length,
+          fileInputs: body.querySelectorAll('input[type="file"]').length,
+        }))
+        .catch(() => null);
+      if (counts)
+        for (const key of Object.keys(totals) as (keyof typeof totals)[])
+          totals[key] += counts[key];
+      const names = await frame
+        .locator("input,textarea,select,button,[role=combobox],[role=radio]")
+        .evaluateAll((elements) =>
+          elements.slice(0, 30).map((el) => {
+            const labels =
+              "labels" in el
+                ? Array.from((el as HTMLInputElement).labels ?? [])
+                    .map((label) => label.textContent ?? "")
+                    .join(" ")
+                : "";
+            return (
+              labels ||
+              el.getAttribute("aria-label") ||
+              el.getAttribute("placeholder") ||
+              el.textContent ||
+              ""
+            )
+              .replace(/\s+/g, " ")
+              .trim()
+              .slice(0, 160);
+          }),
+        )
+        .catch(() => []);
+      accessibleNames.push(...names.filter(Boolean));
+      const html = await frame
+        .locator("body")
+        .evaluate((body) => {
+          const source = body.querySelector("form") ?? body;
+          const clone = source.cloneNode(true) as HTMLElement;
+          clone
+            .querySelectorAll("script,style,noscript,input[type=password]")
+            .forEach((node) => node.remove());
+          clone.querySelectorAll("input,textarea,select").forEach((node) => {
+            node.removeAttribute("value");
+            node.removeAttribute("checked");
+            node.removeAttribute("selected");
+            if (node.tagName === "TEXTAREA") node.textContent = "";
+          });
+          clone
+            .querySelectorAll("[action],[formaction],[href],[src]")
+            .forEach((node) => {
+              node.removeAttribute("action");
+              node.removeAttribute("formaction");
+              node.removeAttribute("href");
+              node.removeAttribute("src");
+            });
+          return clone.outerHTML.slice(0, 30000);
+        })
+        .catch(() => "");
+      if (html) sanitizedForms.push(html);
+    }
+    return {
+      currentUrl: this.url(),
+      pageTitle: await this.page.title(),
+      counts: totals,
+      accessibleNames: accessibleNames.slice(0, 30),
+      sanitizedForms: sanitizedForms.slice(0, 3),
+    };
   }
 }

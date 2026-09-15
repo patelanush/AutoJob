@@ -70,6 +70,8 @@ export const profileSchema = z.object({
       ethnicity: z.string().optional(),
       veteranStatus: z.string().optional(),
       disabilityStatus: z.string().optional(),
+      transgender: z.boolean().optional(),
+      sexualOrientation: z.union([z.string(), z.array(z.string())]).optional(),
     })
     .default({}),
   preferences: z
@@ -77,8 +79,9 @@ export const profileSchema = z.object({
       willingToRelocate: z.boolean().optional(),
       salaryExpectation: z.string().optional(),
       desiredLocations: z.array(z.string()).optional(),
+      jobSource: z.string().default("LinkedIn"),
     })
-    .default({}),
+    .default({ jobSource: "LinkedIn" }),
   approvedFacts: z.record(z.string(), z.unknown()).default({}),
   answerBank: z
     .array(

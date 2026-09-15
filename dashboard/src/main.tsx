@@ -69,6 +69,7 @@ type Status = {
   paused: boolean;
   retained: number;
   limit: number;
+  capabilities?: { runLimit?: boolean };
   queued: number;
   lastError?: string | null;
   feedExceptions?: {

@@ -4,6 +4,7 @@ import { BrowserActions, SafetyStop, type Field } from "../browser/actions.js";
 import {
   AnswerResolver,
   humanOnly,
+  mapQuestion,
   type GenerationContext,
 } from "../answers/resolver.js";
 import type { Profile } from "../config/profile.js";
@@ -25,7 +26,16 @@ export async function prepareFields(
   let fields = await browser.inspect(),
     resumeUploaded = false,
     filled = 0;
-  for (const f of fields.filter((f) => f.type === "file")) {
+  const fileFields = fields.filter((f) => f.type === "file"),
+    requiredResumeFields = fileFields.filter(
+      (f) => f.required && /resume|cv|curriculum/i.test(f.label),
+    ),
+    uploadFields = requiredResumeFields.length
+      ? requiredResumeFields
+      : fileFields
+          .filter((f) => /resume|cv|curriculum/i.test(f.label))
+          .slice(0, 1);
+  for (const f of fileFields) {
     if (/cover.?letter/i.test(f.label)) {
       if (f.required)
         missing.push("Required cover-letter file: provide manually");
@@ -35,8 +45,15 @@ export async function prepareFields(
       if (f.required) missing.push(`Unsupported upload: ${f.label}`);
       continue;
     }
+    if (!uploadFields.includes(f)) continue;
     const path = resolve(root, profile.resume.path),
-      uploaded = await browser.upload(f.token, path);
+      existingName = f.value.split(/[\\/]/).pop(),
+      expectedName = basename(path);
+    if (existingName?.toLowerCase() === expectedName.toLowerCase()) {
+      resumeUploaded = true;
+      continue;
+    }
+    const uploaded = await browser.upload(f.token, path);
     if (uploaded === basename(path)) {
       resumeUploaded = true;
       filled++;
@@ -48,16 +65,16 @@ export async function prepareFields(
     } else missing.push("Resume upload could not be verified");
   }
   fields = await browser.inspect();
-  // Radio choices are resolved as a group, preserving the question separately from each option label.
-  const radioGroups = new Map<string, Field[]>();
+  // Choice controls are resolved as a group, preserving the question separately from each option label.
+  const choiceGroups = new Map<string, Field[]>();
   for (const f of fields)
-    if (f.type === "radio") {
+    if (f.type === "radio" || (f.type === "checkbox" && f.groupLabel)) {
       const key = f.groupLabel || f.groupName || f.label;
-      const group = radioGroups.get(key) ?? [];
+      const group = choiceGroups.get(key) ?? [];
       group.push(f);
-      radioGroups.set(key, group);
+      choiceGroups.set(key, group);
     }
-  for (const [label, group] of radioGroups) {
+  for (const [label, group] of choiceGroups) {
     const q = {
       label,
       type: "radio",
@@ -74,9 +91,16 @@ export async function prepareFields(
           result.answer,
       );
       if (target) {
-        await browser.fill(target.token, "Yes");
-        resolver.record(appId, q, result);
-        filled++;
+        try {
+          await browser.fill(target.token, "checked");
+          resolver.record(appId, q, result);
+          filled++;
+        } catch (error) {
+          if (error instanceof SafetyStop && error.reason === "TAKEOVER")
+            throw error;
+          if (q.required && !mapQuestion(q.label))
+            missing.push(`${label}: unsupported field widget`);
+        }
       }
     } else if (q.required) {
       missing.push(`${label}: ${result.reason}`);
@@ -91,7 +115,7 @@ export async function prepareFields(
     }
   }
   for (const f of fields) {
-    if (f.type === "radio") continue;
+    if (f.type === "radio" || (f.type === "checkbox" && f.groupLabel)) continue;
     if (f.type === "file") continue;
     if (!f.label) {
       if (f.required) missing.push("Unlabeled required field");
@@ -183,7 +207,8 @@ export async function prepareFields(
         filled++;
       } catch (e) {
         if (e instanceof SafetyStop && e.reason === "TAKEOVER") throw e;
-        missing.push(`${f.label}: unsupported field widget`);
+        if (f.required && !mapQuestion(q.label))
+          missing.push(`${f.label}: unsupported field widget`);
       }
     } else if (f.required) {
       missing.push(`${f.label}: ${result.reason}`);

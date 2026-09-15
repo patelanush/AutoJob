@@ -24,6 +24,7 @@ export interface AdapterContext {
   password: () => Promise<string>;
   authPermit?: () => boolean;
   verify?: (browser: BrowserActions) => Promise<boolean>;
+  diagnose?: (reason: string, details: unknown) => Promise<void>;
 }
 export interface AdapterResult {
   status: "READY" | "NEEDS_REVIEW" | "SKIPPED";
@@ -290,12 +291,17 @@ export class StructuredAdapter implements ATSAdapter {
         !(await b.hasControl(
           /^(?:submit|submit application|send application|complete application|finish and submit)$/i,
         ))
-      )
+      ) {
+        await c.diagnose?.(
+          "NO_SUPPORTED_APPLICATION_FIELDS",
+          await b.formDiagnostics(),
+        );
         return outcome(
           totalFilled ? "NEEDS_REVIEW" : "SKIPPED",
           b.stage,
           "No supported application fields or verified final review state found.",
         );
+      }
       const section = fields.map((f) => f.section).join(" ");
       const stage: Stage = /education/i.test(section)
         ? "EDUCATION"
@@ -332,17 +338,23 @@ export class StructuredAdapter implements ATSAdapter {
         `Prepared ${prepared.filled} supported fields.`,
         { missingCount: prepared.missing.length },
       );
-      if (prepared.missing.length)
-        return outcome(
-          "NEEDS_REVIEW",
-          stage,
-          prepared.missing[0],
-          prepared.missing,
+      const validator = new ValidationEngine(),
+        reconciliation = await validator.reconcileKnownRequired(
+          b,
+          c.resolver,
+          c.appId,
+          c.generation,
         );
-      const evidence = await new ValidationEngine().validate(
-        b,
-        c.resolver.factStore,
-      );
+      if (reconciliation.repaired)
+        c.store.event(
+          c.appId,
+          "RECONCILED",
+          `Re-applied and verified ${reconciliation.repaired} known required value(s).`,
+        );
+      const unresolved = [...prepared.missing, ...reconciliation.errors];
+      if (unresolved.length)
+        return outcome("NEEDS_REVIEW", stage, unresolved[0], unresolved);
+      const evidence = await validator.validate(b);
       if (evidence.incorrect.length)
         return outcome(
           "NEEDS_REVIEW",

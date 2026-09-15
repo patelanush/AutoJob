@@ -6,7 +6,9 @@ import { readFileSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import * as s from "./schema.js";
 import { root } from "../config/profile.js";
-import { eligible, type FeedJob } from "../feed/parser.js";
+import type { FeedJob } from "../feed/parser.js";
+import { planFeedSelection } from "../feed/selection.js";
+import type { ATSType } from "../feed/identity.js";
 import { redact } from "../security/privacy.js";
 export type Status =
   | "DISCOVERED"
@@ -93,10 +95,32 @@ export class Store {
       })()
     );
   }
-  ingest(feed: FeedJob[], lookback: number) {
-    let queued = 0;
-    const knownJobs = new Set<string>(),
-      newJobs = new Set<string>();
+  hasApplication(jobId: string) {
+    return !!this.db
+      .select({ id: s.applications.id })
+      .from(s.applications)
+      .where(eq(s.applications.jobId, jobId))
+      .get();
+  }
+  ingest(
+    feed: FeedJob[],
+    lookback: number,
+    options: { limit?: number; ats?: ATSType } = {},
+  ) {
+    const plan = planFeedSelection(
+      feed,
+      lookback,
+      (fingerprint) => {
+        const job = this.findIdentity(fingerprint);
+        return !!job && this.hasApplication(job.id);
+      },
+      options.limit,
+      options.ats,
+    );
+    const selected = new Set(
+      plan.selected.map((job) => job.identity!.fingerprint),
+    );
+    const applicationIds: string[] = [];
     this.db.transaction((tx) => {
       for (const j of feed) {
         const at = now();
@@ -156,19 +180,15 @@ export class Store {
             })
             .where(eq(s.jobs.id, job.id))
             .run();
-        if (!eligible(j, lookback)) continue;
-        const application = tx
-          .select()
-          .from(s.applications)
-          .where(eq(s.applications.jobId, job.id))
-          .get();
-        if (application) {
-          if (!newJobs.has(job.id)) knownJobs.add(job.id);
-          continue;
-        }
+      }
+      for (const fingerprint of selected) {
+        const job = this.findIdentity(fingerprint);
+        if (!job || this.hasApplication(job.id)) continue;
+        const id = randomUUID(),
+          at = now();
         tx.insert(s.applications)
           .values({
-            id: randomUUID(),
+            id,
             jobId: job.id,
             status: "QUEUED",
             stage: "DISCOVERED",
@@ -177,11 +197,18 @@ export class Store {
             lastUrl: job.canonicalApplyUrl,
           })
           .run();
-        queued++;
-        newJobs.add(job.id);
+        applicationIds.push(id);
       }
     });
-    return { queued, alreadyKnown: knownJobs.size };
+    return {
+      queued: applicationIds.length,
+      newJobs: plan.newJobs.length,
+      matchingAts: plan.matchingAts.length,
+      excludedByAts: plan.excludedByAts,
+      alreadyKnown: plan.alreadyKnown,
+      deferred: plan.deferred,
+      applicationIds,
+    };
   }
   transition(
     id: string,

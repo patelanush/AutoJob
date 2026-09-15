@@ -22,7 +22,7 @@ import { AnswerResolver, humanOnly, mapQuestion } from "../answers/resolver.js";
 import { Sessions } from "../browser/session.js";
 import { SafetyStop } from "../browser/actions.js";
 import { fetchFeed, parseFeed, eligible } from "../feed/parser.js";
-import { identify } from "../feed/identity.js";
+import { identify, type ATSType } from "../feed/identity.js";
 import { selectAdapter } from "../ats/index.js";
 import { Keychain } from "../security/keychain.js";
 import { CompatibleProvider } from "../llm/provider.js";
@@ -51,6 +51,8 @@ export class Runtime {
   private authAttempts = new Set<string>();
   private stopping = false;
   private workerTask?: Promise<void>;
+  private activeQueue?: string[];
+  private deferredByLimit = 0;
   private launchWorker() {
     if (!this.busy) this.workerTask = this.work();
   }
@@ -81,7 +83,7 @@ export class Runtime {
     }
     this.sessions = new Sessions(this.store, this.profile);
   }
-  async ingest(lookback: number) {
+  async ingest(lookback: number, limit?: number, ats?: ATSType) {
     if (this.busy) throw new Error("Worker already running");
     this.profile = loadProfile(true);
     this.facts.importProfile(this.profile);
@@ -90,7 +92,12 @@ export class Runtime {
     const raw = await fetchFeed(paths.data);
     writeFileSync(join(paths.data, "feed.latest.md"), raw, { mode: 0o600 });
     const parsed = parseFeed(raw),
-      counts = this.store.ingest(parsed.jobs, lookback);
+      counts = this.store.ingest(parsed.jobs, lookback, { limit, ats });
+    this.activeQueue =
+      limit === undefined && ats === undefined
+        ? undefined
+        : [...counts.applicationIds];
+    this.deferredByLimit = counts.deferred;
     this.feedExceptions = parsed.jobs
       .filter((j) => eligible(j, lookback) && !j.identity)
       .map((j) => ({
@@ -111,12 +118,24 @@ export class Runtime {
           .length,
         queuedCount: counts.queued,
         alreadyKnownCount: counts.alreadyKnown,
+        deferredCount: counts.deferred,
         errorCount: parsed.warnings.length,
       })
       .run();
     this.paused = false;
     this.launchWorker();
-    return { runId: this.runId, ...counts };
+    return {
+      runId: this.runId,
+      eligibleJobs: parsed.jobs.filter((job) => eligible(job, lookback)).length,
+      newJobs: counts.newJobs,
+      matchingAts: counts.matchingAts,
+      excludedByAts: counts.excludedByAts,
+      queued: counts.queued,
+      alreadyKnown: counts.alreadyKnown,
+      deferredByLimit: counts.deferred,
+      limit: limit ?? null,
+      ats: ats ?? null,
+    };
   }
   async submitted(id: string) {
     const a = this.store.application(id);
@@ -130,9 +149,14 @@ export class Runtime {
     );
     await this.sessions.close(id);
   }
-  async retry(id: string, humanResolved = false) {
+  async retry(id: string, humanResolved = false, only = false) {
     loadProfile(true);
     const a = this.store.application(id);
+    const repairedAdapterFalseNegative =
+      a.status === "SKIPPED" &&
+      !a.retryable &&
+      a.attentionReason ===
+        "No supported application fields or verified final review state found.";
     if (a.status === "SUBMITTED")
       throw new Error("Submitted application cannot resume");
     if (a.attemptCount >= 3)
@@ -144,11 +168,22 @@ export class Runtime {
     if (
       a.status === "SKIPPED" &&
       !a.retryable &&
+      !repairedAdapterFalseNegative &&
       (!humanResolved || !this.sessions.has(id))
     )
       throw new Error(
         "Skipped cause needs human resolution before retry; open and resolve it.",
       );
+    if (only && this.busy)
+      throw new Error("Wait for the active worker before an isolated retry.");
+    if (repairedAdapterFalseNegative) {
+      this.store.update(id, { retryable: true });
+      this.store.event(
+        id,
+        "RECLASSIFIED_RETRYABLE",
+        "Previously unsupported field detection is retryable after the adapter fix.",
+      );
+    }
     this.sessions.hosts.check(
       new URL(a.lastUrl ?? this.store.job(a.jobId).canonicalApplyUrl).hostname,
     );
@@ -159,6 +194,7 @@ export class Runtime {
         "Human explicitly confirmed the blocking issue was resolved; one bounded resume requested.",
       );
     this.retryQueue.push(id);
+    if (only) this.activeQueue = [];
     this.paused = false;
     this.launchWorker();
   }
@@ -173,7 +209,14 @@ export class Runtime {
     this.lastError = null;
     try {
       while (!this.stopping && !this.paused) {
-        const id = this.retryQueue[0] ?? this.store.queue()[0]?.id;
+        while (
+          this.activeQueue?.length &&
+          this.store.application(this.activeQueue[0]).status !== "QUEUED"
+        )
+          this.activeQueue.shift();
+        const id =
+          this.retryQueue[0] ??
+          (this.activeQueue ? this.activeQueue[0] : this.store.queue()[0]?.id);
         if (!id) break;
         await this.sessions.start();
         if (
@@ -185,6 +228,7 @@ export class Runtime {
           break;
         }
         if (this.retryQueue[0] === id) this.retryQueue.shift();
+        if (this.activeQueue?.[0] === id) this.activeQueue.shift();
         await this.prepare(id);
       }
     } catch {
@@ -345,6 +389,25 @@ export class Runtime {
             return false;
           }
         },
+        diagnose: async (reason, details) => {
+          const filename = `${id}-${Date.now()}-diagnostic.json`;
+          writeFileSync(
+            artifactPath(filename),
+            JSON.stringify(
+              redact({ reason, detectedATS: adapter.type, details }),
+              null,
+              2,
+            ),
+            { mode: 0o600 },
+          );
+          this.store.event(
+            id,
+            "FORM_DIAGNOSTIC",
+            "Private form diagnostic captured before unsupported-form fallback.",
+            { artifact: filename, reason },
+            this.runId,
+          );
+        },
       });
       if (result.reason?.includes("Security challenge"))
         this.sessions.hosts.challenge(new URL(b.url()).hostname);
@@ -460,7 +523,13 @@ export class Runtime {
           needsReviewCount: count("NEEDS_REVIEW"),
           skippedCount: count("SKIPPED"),
           submittedCount: count("SUBMITTED"),
-          deferredCount: summary.QUEUED,
+          deferredCount:
+            this.deferredByLimit +
+            (this.activeQueue
+              ? this.activeQueue.filter(
+                  (id) => this.store.application(id).status === "QUEUED",
+                ).length
+              : summary.QUEUED),
         })
         .where(eq(runs.id, this.runId))
         .run();

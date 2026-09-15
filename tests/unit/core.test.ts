@@ -3,6 +3,11 @@ import { readFileSync } from "node:fs";
 import { profileSchema } from "../../src/config/profile.js";
 import { parseFeed, ageDays, eligible } from "../../src/feed/parser.js";
 import { canonicalize, identify } from "../../src/feed/identity.js";
+import {
+  parseAtsType,
+  parseLimit,
+  planFeedSelection,
+} from "../../src/feed/selection.js";
 import { Store, canTransition } from "../../src/db/store.js";
 import { FactStore } from "../../src/answers/facts.js";
 import {
@@ -11,7 +16,11 @@ import {
   mapValue,
   humanOnly,
 } from "../../src/answers/resolver.js";
-import { authorizeAction, isFinalAction } from "../../src/browser/actions.js";
+import {
+  authorizeAction,
+  fieldValueMatches,
+  isFinalAction,
+} from "../../src/browser/actions.js";
 import { redact, safeUrl } from "../../src/security/privacy.js";
 import { HostSafety } from "../../src/browser/hosts.js";
 import { chooseVerification } from "../../src/verification/gmail.js";
@@ -108,7 +117,12 @@ describe("state and dedupe", () => {
     expect(s.queue()).toHaveLength(2);
     expect(s.ingest(parseFeed(feed).jobs, 7)).toEqual({
       queued: 0,
+      newJobs: 0,
+      matchingAts: 0,
+      excludedByAts: 0,
       alreadyKnown: 2,
+      deferred: 0,
+      applicationIds: [],
     });
     s.close();
   });
@@ -139,6 +153,218 @@ describe("state and dedupe", () => {
     }
     expect(() => s.startAttempt(id)).toThrow("limit");
     s.close();
+  });
+});
+describe("live-run limits", () => {
+  const jobs = Array.from({ length: 5 }, (_, index) => {
+    const url = `https://example.com/jobs/${index + 1}`;
+    return {
+      company: `Company ${index + 1}`,
+      role: "Engineer",
+      category: "Engineering",
+      locationRaw: "Remote",
+      originalApplyUrl: url,
+      simplifyUrl: null,
+      ageDays: index,
+      isClosed: false,
+      observationKey: `observation-${index + 1}`,
+      identity: identify(url),
+    };
+  });
+  it.each([
+    [undefined, 5, 0],
+    [1, 1, 4],
+    [3, 3, 2],
+    [10, 5, 0],
+  ])("limit %s queues %i and defers %i", (limit, queued, deferred) => {
+    const store = new Store(":memory:");
+    const result = store.ingest(jobs, 7, { limit });
+    expect(result.queued).toBe(queued);
+    expect(result.deferred).toBe(deferred);
+    expect(store.queue()).toHaveLength(queued);
+    expect(
+      jobs.filter((job) => {
+        const stored = store.findIdentity(job.identity.fingerprint)!;
+        return store.hasApplication(stored.id);
+      }),
+    ).toHaveLength(queued);
+    store.close();
+  });
+  it("does not count already-known jobs against the limit", () => {
+    const store = new Store(":memory:");
+    store.ingest([jobs[0]], 7);
+    const result = store.ingest(jobs, 7, { limit: 1 });
+    expect(result).toMatchObject({
+      queued: 1,
+      newJobs: 4,
+      alreadyKnown: 1,
+      deferred: 3,
+    });
+    expect(result.applicationIds).toHaveLength(1);
+    expect(store.queue()).toHaveLength(2);
+    store.close();
+  });
+  it("rejects invalid CLI and storage limits", () => {
+    for (const value of ["0", "-1", "abc", "1.5"])
+      expect(() => parseLimit(value)).toThrow("positive integer");
+    expect(parseLimit("1")).toBe(1);
+    expect(parseLimit("10")).toBe(10);
+    const store = new Store(":memory:");
+    for (const limit of [0, -1, 1.5, Number.NaN])
+      expect(() => store.ingest(jobs, 7, { limit })).toThrow(
+        "positive integer",
+      );
+    store.close();
+  });
+  it("plans a limited dry run without mutating state", () => {
+    const known = new Set([jobs[0].identity.fingerprint]);
+    const before = [...known];
+    const plan = planFeedSelection(jobs, 7, (id) => known.has(id), 3);
+    expect(plan).toMatchObject({
+      eligibleRows: 5,
+      alreadyKnown: 1,
+      deferred: 1,
+    });
+    expect(plan.newJobs).toHaveLength(4);
+    expect(plan.selected).toHaveLength(3);
+    expect([...known]).toEqual(before);
+  });
+});
+describe("ATS-targeted selection", () => {
+  const definitions = [
+    [
+      "Workday One",
+      "https://acme.wd5.myworkdayjobs.com/en-US/jobs/job/Remote/Engineer_R100",
+    ],
+    ["Greenhouse One", "https://job-boards.greenhouse.io/acme/jobs/1001"],
+    [
+      "Ashby One",
+      "https://jobs.ashbyhq.com/acme/11111111-1111-4111-8111-111111111111",
+    ],
+    [
+      "Workday Two",
+      "https://other.wd5.myworkdayjobs.com/en-US/jobs/job/Remote/Engineer_R200",
+    ],
+    ["Greenhouse Two", "https://boards.greenhouse.io/other/jobs/2002"],
+  ] as const;
+  const jobs = definitions.map(([company, url], index) => ({
+    company,
+    role: "Engineer",
+    category: "Engineering",
+    locationRaw: "Remote",
+    originalApplyUrl: url,
+    simplifyUrl: null,
+    ageDays: index,
+    isClosed: false,
+    observationKey: `ats-observation-${index}`,
+    identity: identify(url),
+  }));
+
+  it.each([
+    ["workday", 2],
+    ["greenhouse", 2],
+    ["ashby", 1],
+  ] as const)("selects only %s jobs", (ats, expected) => {
+    const plan = planFeedSelection(jobs, 7, () => false, undefined, ats);
+    expect(plan.newJobs).toHaveLength(5);
+    expect(plan.matchingAts).toHaveLength(expected);
+    expect(plan.selected).toHaveLength(expected);
+    expect(plan.selected.every((job) => job.identity?.atsType === ats)).toBe(
+      true,
+    );
+  });
+
+  it("omitting ATS preserves the complete new queue", () => {
+    const plan = planFeedSelection(jobs, 7, () => false);
+    expect(plan.matchingAts).toEqual(plan.newJobs);
+    expect(plan.selected).toEqual(plan.newJobs);
+    expect(plan.excludedByAts).toBe(0);
+  });
+
+  it("applies limit after ATS selection", () => {
+    const plan = planFeedSelection(jobs, 7, () => false, 1, "workday");
+    expect(plan.newJobs).toHaveLength(5);
+    expect(plan.matchingAts).toHaveLength(2);
+    expect(plan.selected).toHaveLength(1);
+    expect(plan.selected[0].identity?.atsType).toBe("workday");
+    expect(plan.deferred).toBe(1);
+    expect(plan.excludedByAts).toBe(3);
+  });
+
+  it("removes already-known jobs before ATS filtering", () => {
+    const store = new Store(":memory:");
+    store.ingest([jobs[0]], 7);
+    const result = store.ingest(jobs, 7, { ats: "workday", limit: 1 });
+    expect(result).toMatchObject({
+      newJobs: 4,
+      matchingAts: 1,
+      alreadyKnown: 1,
+      queued: 1,
+      excludedByAts: 3,
+    });
+    store.close();
+  });
+
+  it("creates no application records for ATS-excluded jobs", () => {
+    const store = new Store(":memory:");
+    const result = store.ingest(jobs, 7, { ats: "workday", limit: 1 });
+    expect(result.queued).toBe(1);
+    const selectedJobId = store.application(result.applicationIds[0]).jobId;
+    for (const job of jobs) {
+      const stored = store.findIdentity(job.identity.fingerprint)!;
+      expect(store.hasApplication(stored.id)).toBe(stored.id === selectedJobId);
+    }
+    expect(
+      jobs
+        .filter((job) => job.identity.atsType !== "workday")
+        .every((job) => {
+          const stored = store.findIdentity(job.identity.fingerprint)!;
+          return !store.hasApplication(stored.id);
+        }),
+    ).toBe(true);
+    store.close();
+  });
+
+  it("dry-run ATS planning performs zero database writes", () => {
+    const store = new Store(":memory:"),
+      before = {
+        jobs: store.sqlite.prepare("SELECT count(*) n FROM jobs").get(),
+        applications: store.sqlite
+          .prepare("SELECT count(*) n FROM applications")
+          .get(),
+      };
+    const plan = planFeedSelection(
+      jobs,
+      7,
+      (fingerprint) => {
+        const job = store.findIdentity(fingerprint);
+        return !!job && store.hasApplication(job.id);
+      },
+      1,
+      "ashby",
+    );
+    expect(plan.selected).toHaveLength(1);
+    expect({
+      jobs: store.sqlite.prepare("SELECT count(*) n FROM jobs").get(),
+      applications: store.sqlite
+        .prepare("SELECT count(*) n FROM applications")
+        .get(),
+    }).toEqual(before);
+    store.close();
+  });
+
+  it("rejects invalid ATS names before selection", () => {
+    expect(parseAtsType(undefined)).toBeUndefined();
+    for (const ats of [
+      "workday",
+      "greenhouse",
+      "ashby",
+      "icims",
+      "oracle",
+      "generic",
+    ])
+      expect(parseAtsType(ats)).toBe(ats);
+    expect(() => parseAtsType("lever")).toThrow("ATS must be one of");
   });
 });
 describe("facts and answers", () => {
@@ -181,6 +407,142 @@ describe("facts and answers", () => {
   ])("never persists %s", (key) => {
     const s = makeStore();
     expect(() => new FactStore(s).set(key, "sensitive")).toThrow();
+    s.close();
+  });
+  it.each([
+    ["Email", "contact.email"],
+    ["E-mail", "contact.email"],
+    ["Preferred Email", "contact.email"],
+    ["Contact Email", "contact.email"],
+    ["Phone", "contact.phone"],
+    ["Mobile", "contact.phone"],
+    ["Cell Phone", "contact.phone"],
+    ["Telephone", "contact.phone"],
+    ["Primary Phone", "contact.phone"],
+    ["Current Location", "contact.location"],
+    ["Are you willing to relocate?", "preferences.willingToRelocate"],
+    ["Are you open to relocation?", "preferences.willingToRelocate"],
+    ["How did you learn about this opportunity?", "preferences.jobSource"],
+    ["Where did you find this role?", "preferences.jobSource"],
+  ])("maps shared semantic alias %s", (question, key) => {
+    expect(mapQuestion(question)).toMatchObject({ key });
+  });
+  it("uses the global LinkedIn preference for source fields and choices", async () => {
+    const s = makeStore(),
+      f = new FactStore(s);
+    f.importProfile(profile);
+    const r = new AnswerResolver(f, profile),
+      id = s.queue()[0].id,
+      context = {
+        company: "Acme",
+        role: "Engineer",
+        description: "",
+        facts: {},
+      };
+    expect(
+      await r.resolve(
+        {
+          label: "How did you hear about this job?",
+          type: "text",
+          choices: [],
+          required: true,
+        },
+        id,
+        context,
+      ),
+    ).toMatchObject({ answer: "LinkedIn", key: "preferences.jobSource" });
+    expect(
+      await r.resolve(
+        {
+          label: "Referral source",
+          type: "select",
+          choices: ["Company site", "Social Media - LinkedIn", "Other"],
+          required: true,
+        },
+        id,
+        context,
+      ),
+    ).toMatchObject({ answer: "Social Media - LinkedIn" });
+    expect(
+      await r.resolve(
+        {
+          label: "Source",
+          type: "select",
+          choices: ["Company site", "Other"],
+          required: true,
+        },
+        id,
+        context,
+      ),
+    ).toMatchObject({ answer: "Other" });
+    s.close();
+  });
+  it("derives the current application location from configured city and state", () => {
+    const s = makeStore(),
+      p = structuredClone(profile);
+    p.personal.city = "Beaverton";
+    p.personal.state = "Oregon";
+    const f = new FactStore(s);
+    f.importProfile(p);
+    expect(f.get("contact.location")?.parsed).toBe("Beaverton, OR");
+    s.close();
+  });
+  it("recognizes equivalent formatted phone values without rewriting the fact", () => {
+    expect(
+      fieldValueMatches(
+        {
+          token: 0,
+          label: "Primary Phone",
+          type: "tel",
+          required: true,
+          choices: [],
+          value: "(555) 010-0000",
+          error: "",
+          section: "Contact",
+          groupIndex: 0,
+        },
+        "5550100000",
+      ),
+    ).toBe(true);
+  });
+  it("leaves optional preferred name unknown and falls back when required", async () => {
+    const s = makeStore(),
+      p = structuredClone(profile);
+    delete p.personal.preferredName;
+    const f = new FactStore(s);
+    f.importProfile(p);
+    const r = new AnswerResolver(f, p),
+      id = s.queue()[0].id,
+      context = {
+        company: "Acme",
+        role: "Engineer",
+        description: "",
+        facts: {},
+      };
+    expect(
+      await r.resolve(
+        {
+          label: "Preferred First Name",
+          type: "text",
+          choices: [],
+          required: false,
+        },
+        id,
+        context,
+      ),
+    ).toHaveProperty("reason");
+    expect(
+      await r.resolve(
+        {
+          label: "Preferred First Name",
+          type: "text",
+          choices: [],
+          required: true,
+        },
+        id,
+        context,
+      ),
+    ).toMatchObject({ answer: p.personal.firstName });
     s.close();
   });
   it("maps citizenship facts to boolean or country field", async () => {
@@ -255,6 +617,114 @@ describe("facts and answers", () => {
         required: true,
       }),
     ).toBeNull());
+  it.each([
+    ["Do you identify as transgender?", "demographics.transgender"],
+    ["Are you transgender?", "demographics.transgender"],
+    ["Transgender status", "demographics.transgender"],
+    ["Gender identity: transgender", "demographics.transgender"],
+    ["Sexual orientation", "demographics.sexualOrientation"],
+    [
+      "Which sexual orientation best describes you?",
+      "demographics.sexualOrientation",
+    ],
+    ["Sexual identity", "demographics.sexualOrientation"],
+  ])("maps demographic alias %s independently", (question, key) => {
+    expect(mapQuestion(question)).toMatchObject({ key, scope: "global" });
+  });
+  it("selects the configured race at the most specific offered level", () => {
+    expect(
+      mapValue(["Asian", "South Asian"], {
+        label: "Race",
+        type: "select",
+        choices: ["Asian", "White", "Black"],
+        required: false,
+      }),
+    ).toBe("Asian");
+    expect(
+      mapValue(["Asian", "South Asian"], {
+        label: "Racial/ethnic background",
+        type: "checkbox",
+        choices: ["South Asian", "East Asian", "Southeast Asian"],
+        required: false,
+      }),
+    ).toBe("South Asian");
+    expect(
+      mapValue(["Asian", "South Asian"], {
+        label: "Racial/ethnic background",
+        type: "checkbox",
+        choices: ["Asian", "South Asian", "East Asian", "Southeast Asian"],
+        required: false,
+      }),
+    ).toBe("South Asian");
+  });
+  it("maps confirmed transgender and sexual-orientation facts conservatively", () => {
+    expect(
+      mapValue(false, {
+        label: "Do you identify as transgender?",
+        type: "radio",
+        choices: ["Yes", "No", "Prefer not to answer"],
+        required: false,
+      }),
+    ).toBe("No");
+    expect(
+      mapValue("Heterosexual", {
+        label: "Sexual orientation",
+        type: "radio",
+        choices: ["Straight", "Gay", "Bisexual"],
+        required: false,
+      }),
+    ).toBe("Straight");
+    expect(
+      mapValue("Heterosexual", {
+        label: "Sexual orientation",
+        type: "radio",
+        choices: ["Heterosexual / Straight", "Gay", "Bisexual"],
+        required: false,
+      }),
+    ).toBe("Heterosexual / Straight");
+  });
+  it("maps Ashby-specific factual choices conservatively", () => {
+    expect(
+      mapValue("Male", {
+        label: "How would you describe your gender identity?",
+        type: "checkbox",
+        choices: ["Man", "Woman", "Non-binary"],
+        required: false,
+      }),
+    ).toBe("Man");
+    expect(
+      mapValue("Bachelor of Science", {
+        label: "Which degree are you currently pursuing?",
+        type: "radio",
+        choices: ["Bachelors", "Masters", "PhD"],
+        required: true,
+      }),
+    ).toBe("Bachelors");
+    expect(
+      mapValue("2026-05", {
+        label: "When is your expected graduation date?",
+        type: "radio",
+        choices: ["2025", "2026", "January - June 2027"],
+        required: true,
+      }),
+    ).toBe("2026");
+    expect(
+      mapValue("Not a veteran", {
+        label: "Are you a veteran or active member of the Armed Forces?",
+        type: "radio",
+        choices: ["Yes, I am a veteran", "No, I am not a veteran"],
+        required: false,
+      }),
+    ).toBe("No, I am not a veteran");
+    expect(
+      mapValue("Asian", {
+        label: "How would you describe your racial/ethnic background?",
+        type: "checkbox",
+        choices: ["South Asian", "East Asian", "Southeast Asian"],
+        required: false,
+      }),
+    ).toBeNull();
+  });
   it("human attestation is always reserved", () =>
     expect(humanOnly("I certify all information is true")).toBe(true));
 });

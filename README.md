@@ -57,6 +57,16 @@ Omit unknown facts; never substitute example values. The real profile remains
 editable and is never committed. Live preparation rejects placeholder identity
 and missing resumes.
 
+`preferences.jobSource` is the reusable answer for normal referral/source
+questions and defaults to `LinkedIn`. Text fields receive that value directly;
+choice controls prefer a LinkedIn option and conservatively fall back to `Other`.
+
+Optional demographic facts include `demographics.race` (a string or list),
+`demographics.transgender` (boolean), and `demographics.sexualOrientation`
+(a string or list). Configured values are answered consistently; missing values
+remain unanswered. Specific race values take precedence over a generic parent
+category when both are offered by a form.
+
 `resume.path` can be an absolute path or a path relative to the project. One
 primary resume is used. PDF text extraction is available with:
 
@@ -139,8 +149,12 @@ block the rest of the run.
 ```sh
 npm run dry-run                       # Feed + dedupe report only; no employer visits
 npm run dry-run -- --lookback 7
+npm run dry-run -- --limit 1         # Show one selected new job; write no state
+npm run dry-run -- --ats workday
 npm run apply                         # Start/connect runtime, ingest and prepare
 npm run apply -- --lookback 7
+npm run apply -- --limit 1           # Safest first live run: prepare one new job
+npm run apply -- --ats workday --limit 1
 npm run dashboard                     # Dashboard/runtime without preparing jobs
 npm run status
 npm run retry -- --application APPLICATION_UUID
@@ -189,9 +203,16 @@ alias in My Application Facts to enable reuse.
 
 Edit/Correct facts to affect future applications immediately. Delete/Mark Unknown
 invalidates reuse without letting stale profile imports resurrect a value. Fact
-history records revisions. Changed private-profile values create visible conflicts.
+history records revisions. A value previously imported only from the private
+profile follows later profile edits. Human-confirmed/corrected facts retain
+precedence and expose later profile disagreement for review.
 Expired temporary facts are unavailable. Confirmed experience numbers are reused,
 not automatically inflated with time.
+
+Before an outcome is assigned, required controls with known semantic facts are
+reconciled against their actual UI state. A dropped email, phone, location or
+choice is retried once and reported as an automation error if the site still does
+not retain it. Correct existing values are left intact.
 
 Details can check visible browser corrections and stage them for confirmation;
 it does not record arbitrary keystrokes or silently modify shared facts. Human edits
@@ -215,12 +236,35 @@ job does not disappear merely because it ages past seven days while paused.
 Record applications made before installation through the dashboard or history CLI.
 Unknown historical submissions cannot be detected universally.
 
+`--limit` is applied only after the complete rolling-window scan and permanent
+dedupe. All eligible jobs are recorded as discovered, but only the selected new
+jobs receive application rows or attempts. Deferred jobs therefore remain new and
+can be selected on a later run. Existing applications do not consume the limit.
+Omitting the option preserves the normal unlimited queue behavior. Limits must be
+positive integers.
+
+`--ats` accepts `workday`, `greenhouse`, `ashby`, `icims`, `oracle`, or
+`generic`. Selection applies rolling lookback and permanent application dedupe
+first, filters the remaining new jobs by ATS, and applies `--limit` last. Jobs
+excluded by ATS or limit receive no application/attempt record and remain eligible
+for later runs. Dry-run reports the total new queue, ATS matches, exclusions, and
+the final number that would be processed without changing SQLite.
+
 One to two transient navigation retries are permitted; preparation has three attempts
 maximum. Resume is explicit. Security challenges/429s pause a host for the run;
 repeated main-document 403s do likewise. No CAPTCHA retries or credential resets. After normal human resolution, open the skipped tab and explicitly confirm its blocker is resolved before resuming. Host circuits remain active for the current run; start a fresh manual run if that host is paused.
 Startup retains interrupted attempts, downgrades stale PROCESSING/READY to review,
 and uses normal ATS drafts where available. Persistent cookies do not guarantee
 unsaved form restoration. Ambiguous identity/account recovery stops safely.
+
+The CLI retry command is isolated: it resumes only the named existing application
+and does not drain other queued jobs afterward. Adapter false negatives recorded
+with the legacy “No supported application fields” reason are automatically
+reclassified as retryable after the inspector fix.
+
+Before an unsupported-form fallback, the worker saves a private JSON diagnostic in
+`data/artifacts/` alongside the screenshot. It includes bounded control counts and
+labels plus value-scrubbed form markup. Credentials, cookies and tokens are excluded.
 
 ## Development and debugging
 

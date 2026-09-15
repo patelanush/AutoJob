@@ -9,6 +9,7 @@ import {
   answerHistory,
 } from "../db/schema.js";
 import type { Profile } from "../config/profile.js";
+import { formatCurrentLocation } from "../utils/location.js";
 export function normalize(q: string) {
   return q
     .toLowerCase()
@@ -31,10 +32,7 @@ export class FactStore {
       .from(facts)
       .where(and(eq(facts.canonicalKey, key), eq(facts.scope, scope)))
       .get();
-    return f &&
-      !f.unknown &&
-      !f.notes?.startsWith("PROFILE_CONFLICT:") &&
-      (!f.expiresAt || f.expiresAt > now())
+    return f && !f.unknown && (!f.expiresAt || f.expiresAt > now())
       ? { ...f, parsed: JSON.parse(f.value ?? "null") as unknown }
       : null;
   }
@@ -108,6 +106,7 @@ export class FactStore {
       existing?.value === encoded &&
       !existing.unknown &&
       !options.correct &&
+      !existing.notes?.startsWith("PROFILE_CONFLICT:") &&
       !source.startsWith("HUMAN")
     )
       return existing.id;
@@ -257,7 +256,22 @@ export class FactStore {
       .run();
   }
   importProfile(p: Profile) {
+    const fullName = [
+      p.personal.firstName,
+      p.personal.middleName,
+      p.personal.lastName,
+    ]
+      .filter(Boolean)
+      .join(" ");
+    const location = formatCurrentLocation(p.personal.city, p.personal.state),
+      configuredRaces = Array.isArray(p.demographics.race)
+        ? p.demographics.race
+        : p.demographics.race
+          ? [p.demographics.race]
+          : [],
+      normalizedRaces = configuredRaces.map(normalize);
     const mapping: Record<string, unknown> = {
+      "contact.fullName": fullName,
       "contact.firstName": p.personal.firstName,
       "contact.middleName": p.personal.middleName,
       "contact.lastName": p.personal.lastName,
@@ -269,6 +283,7 @@ export class FactStore {
       "contact.state": p.personal.state,
       "contact.zip": p.personal.zip,
       "contact.country": p.personal.country,
+      "contact.location": location || undefined,
       "links.linkedin": p.links.linkedin,
       "links.github": p.links.github,
       "links.portfolio": p.links.portfolio,
@@ -283,6 +298,24 @@ export class FactStore {
           v,
         ]),
       ),
+      "demographics.race.asian": normalizedRaces.some((race) =>
+        ["asian", "south asian", "east asian", "southeast asian"].includes(
+          race,
+        ),
+      )
+        ? true
+        : undefined,
+      "demographics.race.southAsian": normalizedRaces.includes("south asian")
+        ? true
+        : undefined,
+      "demographics.race.eastAsian": normalizedRaces.includes("east asian")
+        ? true
+        : undefined,
+      "demographics.race.southeastAsian": normalizedRaces.includes(
+        "southeast asian",
+      )
+        ? true
+        : undefined,
       ...Object.fromEntries(
         Object.entries(p.preferences).map(([k, v]) => [`preferences.${k}`, v]),
       ),
@@ -305,6 +338,13 @@ export class FactStore {
           .get();
         if (existing?.unknown) continue;
         if (existing && existing.value !== JSON.stringify(value)) {
+          if (existing.source === "INITIAL_PROFILE") {
+            this.set(key, value, {
+              source: "INITIAL_PROFILE",
+              correct: true,
+            });
+            continue;
+          }
           const baseline = this.store.db
             .select()
             .from(factHistory)

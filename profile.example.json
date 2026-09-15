@@ -14,8 +14,11 @@
   "education": [],
   "employment": [],
   "authorization": {},
-  "demographics": {},
-  "preferences": {},
+  "demographics": {
+    "transgender": false,
+    "sexualOrientation": "Example orientation"
+  },
+  "preferences": { "jobSource": "LinkedIn" },
   "approvedFacts": {},
   "resume": { "path": "private/resume.pdf" },
   "browser": { "reviewTabLimit": 10 }
